@@ -269,6 +269,6 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ## 🏢 About
 
-Developed by **邦道科技 (Bangdao Tech)** as part of the data element market infrastructure.
-
 Knowledge Hub is a core component of multi-agent knowledge management, supporting distributed AI agent collaboration through shared, quality-controlled knowledge bases.
+
+**个人开源项目** — 欢迎贡献、Star、Issue。
