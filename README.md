@@ -12,6 +12,8 @@ A lightweight, self-hosted knowledge aggregation server designed for **multi-age
 
 🌐 **Bilingual UI**: Full Chinese (默认) and English interface with one-click switching.
 
+[中文文档](README.zh.md)
+
 ---
 
 ## ✨ Features
