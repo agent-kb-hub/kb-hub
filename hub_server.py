@@ -8,7 +8,6 @@ knowledge-hub-server.py — 知识中心 Hub HTTP 服务
 import sys
 import os
 import json
-import hashlib
 import secrets
 import logging
 import time
@@ -25,7 +24,39 @@ from fastapi import FastAPI, HTTPException, Request, Header, Depends, Form, Resp
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from tinydb import TinyDB, Query
+from knowledge_hub.admin import (
+    build_token_listing,
+    upsert_config_node,
+)
+from knowledge_hub.admin_routes import register_admin_api_routes
+from knowledge_hub.auth import (
+    build_node_auth_info,
+    extract_bearer_token,
+    is_session_valid,
+    resolve_admin_bearer,
+    resolve_node_from_token,
+)
+from knowledge_hub.config import materialize_node_config
+from knowledge_hub.ingest import prepare_ingest_item, prepare_sync_item, validate_knowledge_item
+from knowledge_hub.paths import resolve_local_db_path as resolve_config_local_db_path
+from knowledge_hub.query import build_query_results
+from knowledge_hub.search import content_hash
+from knowledge_hub.security import hash_password, verify_password
+from knowledge_hub.stats import build_dashboard_model, build_hub_stats, build_node_query_stats, build_usage_stats
+from knowledge_hub.storage import (
+    delete_knowledge_store_item,
+    increment_usage_counts,
+    increment_store_usage_counts,
+    insert_knowledge_item,
+    insert_knowledge_if_missing,
+    maintain_knowledge_store,
+    open_hub_db as open_configured_hub_db,
+    open_local_db as open_configured_local_db,
+    read_knowledge_items,
+    read_table,
+    resolve_hub_db_path,
+    update_knowledge_store_item,
+)
 
 # ─── 配置加载 ───
 CONFIG_PATH = HUB_DIR / "config.json"
@@ -90,12 +121,9 @@ def build_content_hash_index(config: dict):
     global CONTENT_HASH_INDEX
     CONTENT_HASH_INDEX = {}
     try:
-        hub_db = open_hub_db(config)
-        hub_tbl = hub_db.table("knowledge")
-        for item in hub_tbl.all():
+        for item in read_knowledge_items(config, HUB_DIR):
             h = content_hash(item.get("title", ""), item.get("summary", ""))
             CONTENT_HASH_INDEX[h] = True
-        hub_db.close()
         logger.info(f"内容 hash 索引构建完成: {len(CONTENT_HASH_INDEX)} 条")
     except Exception as e:
         logger.warning(f"hash 索引构建失败: {e}")
@@ -105,30 +133,12 @@ def init_config():
     """加载配置，首次运行时自动分配 token"""
     global NODE_TOKENS, NODE_TOKEN_MAP
     config = json.loads(CONFIG_PATH.read_text())
-    nodes = config.get("nodes", {})
-    needs_save = False
-
-    for node_name, node_conf in nodes.items():
-        token = node_conf.get("token", "AUTO_GENERATED")
-        if token == "AUTO_GENERATED":
-            token = secrets.token_urlsafe(24)
-            node_conf["token"] = token
-            needs_save = True
-        NODE_TOKENS[node_name] = {
-            "token": token,
-            "role": node_conf.get("role", "reader"),
-            "description": node_conf.get("description", ""),
-        }
-        NODE_TOKEN_MAP[token] = node_name
+    NODE_TOKENS, NODE_TOKEN_MAP, config, needs_save = materialize_node_config(
+        config,
+        lambda: secrets.token_urlsafe(24),
+    )
 
     if needs_save:
-        config["nodes"] = {}
-        for n, nc in nodes.items():
-            config["nodes"][n] = {
-                "token": NODE_TOKENS[n]["token"],
-                "role": NODE_TOKENS[n]["role"],
-                "description": NODE_TOKENS[n]["description"],
-            }
         CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2))
 
     logger.info(f"已加载 {len(NODE_TOKENS)} 个节点配置")
@@ -164,11 +174,12 @@ def authenticate_node_or_admin(
     # 回退到 node token
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, t(lang, "auth.missing_token"))
-    token = authorization[7:]
-    node_name = NODE_TOKEN_MAP.get(token)
-    if not node_name:
+    token = extract_bearer_token(authorization)
+    node = resolve_node_from_token(token, NODE_TOKEN_MAP, NODE_TOKENS)
+    if not node:
         raise HTTPException(403, t(lang, "auth.invalid_token"))
-    return {"name": node_name, "lang": lang, **NODE_TOKENS[node_name], "is_admin": False}
+    node_name = node["name"]
+    return build_node_auth_info(node_name, NODE_TOKENS[node_name], lang)
 
 def authenticate_node(
     authorization: Optional[str] = Header(None),
@@ -192,12 +203,13 @@ def authenticate_node(
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, t(lang, "auth.missing_token"))
 
-    token = authorization[7:]  # 去掉 "Bearer "
-    node_name = NODE_TOKEN_MAP.get(token)
-    if not node_name:
+    token = extract_bearer_token(authorization)
+    node = resolve_node_from_token(token, NODE_TOKEN_MAP, NODE_TOKENS)
+    if not node:
         raise HTTPException(403, t(lang, "auth.invalid_token"))
 
-    return {"name": node_name, "lang": lang, **NODE_TOKENS[node_name]}
+    node_name = node["name"]
+    return build_node_auth_info(node_name, NODE_TOKENS[node_name], lang)
 
 def check_rate_limit(node_info: dict):
     """检查速率限制"""
@@ -205,8 +217,8 @@ def check_rate_limit(node_info: dict):
     node = node_info["name"]
     lang = node_info.get("lang", "zh")
     now = time.time()
-    window = 60
-    limit = 100
+    window = int(NODE_CONFIG.get("rate_limit_window_seconds", 60) or 60)
+    limit = int(NODE_CONFIG.get("rate_limit_per_node", 100) or 100)
 
     # 清理过期记录
     RATE_LIMITS[node] = [t for t in RATE_LIMITS[node] if now - t < window]
@@ -217,23 +229,54 @@ def check_rate_limit(node_info: dict):
 # ─── Admin Session 认证 ────────────────────────────────────────────────
 ADMIN_SESSION_COOKIE = "kh_admin_session"
 ADMIN_SESSIONS = {}  # session_id -> {"username": str, "created_at": float}
+DASHBOARD_SESSION_COOKIE = "kh_dashboard_session"
+DASHBOARD_SESSIONS = {}  # session_id -> {"node": str, "created_at": float}
+PUBLIC_BASE_PATH = ""
 
-def hash_password(password: str) -> str:
-    """SHA256 哈希密码，格式: sha256:<salt>:<hash>"""
-    salt = secrets.token_hex(16)
-    h = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"sha256:{salt}:{h}"
 
-def verify_password(password: str, stored: str) -> bool:
-    """验证密码是否匹配存储哈希"""
-    if not stored or not stored.startswith("sha256:"):
-        return False
-    parts = stored.split(":")
-    if len(parts) != 3:
-        return False
-    _, salt, expected = parts
-    h = hashlib.sha256((salt + password).encode()).hexdigest()
-    return h == expected
+def normalize_public_base_path(value: str = "") -> str:
+    """Return a clean URL prefix such as /avatar-expose/xxxx/kb-hub."""
+    if not value:
+        return ""
+    value = str(value).strip()
+    if not value or value == "/":
+        return ""
+    if not value.startswith("/"):
+        value = "/" + value
+    return value.rstrip("/")
+
+
+def public_path(path: str = "/") -> str:
+    """Build a browser-visible path that preserves the configured prefix."""
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{PUBLIC_BASE_PATH}{path}"
+
+
+def public_base_url(request: Request = None) -> str:
+    if request is not None:
+        return f"{str(request.base_url).rstrip('/')}{PUBLIC_BASE_PATH}"
+    return PUBLIC_BASE_PATH or ""
+
+
+def prepare_html_for_public_base(html: str) -> str:
+    """Patch legacy absolute browser URLs to the configured public base path."""
+    if not PUBLIC_BASE_PATH:
+        return html
+    replacements = {
+        'src="/static/': f'src="{PUBLIC_BASE_PATH}/static/',
+        'href="/static/': f'href="{PUBLIC_BASE_PATH}/static/',
+        'href="/admin/logout"': f'href="{PUBLIC_BASE_PATH}/admin/logout"',
+        'action="/admin/login"': f'action="{PUBLIC_BASE_PATH}/admin/login"',
+        'const BASE = window.location.origin;': (
+            "const BASE = window.location.origin + "
+            + json.dumps(PUBLIC_BASE_PATH)
+            + ";"
+        ),
+    }
+    for old, new in replacements.items():
+        html = html.replace(old, new)
+    return html
 
 def authenticate_admin(request: Request = None) -> Optional[dict]:
     """验证管理员 session cookie，返回 session 信息"""
@@ -246,8 +289,25 @@ def authenticate_admin(request: Request = None) -> Optional[dict]:
     if not session:
         return None
     # 检查 session 是否过期（24小时）
-    if time.time() - session["created_at"] > 86400:
+    if not is_session_valid(session, time.time()):
         del ADMIN_SESSIONS[cookie]
+        return None
+    return session
+
+
+def authenticate_dashboard(request: Request = None) -> Optional[dict]:
+    """Validate a dashboard session cookie."""
+    if not request:
+        return None
+    cookie = request.cookies.get(DASHBOARD_SESSION_COOKIE)
+    if not cookie:
+        return None
+    session = DASHBOARD_SESSIONS.get(cookie)
+    if not session:
+        return None
+    ttl = int(NODE_CONFIG.get("dashboard_session_ttl_seconds", 3600) or 3600)
+    if not is_session_valid(session, time.time(), ttl_seconds=ttl):
+        del DASHBOARD_SESSIONS[cookie]
         return None
     return session
 
@@ -302,168 +362,71 @@ def resolve_lang(request: Request, lang_param: str = None, lang_cookie: str = No
         return detect_lang(accept)
     return DEFAULT_LANG
 
-# ─── 质量自动评估 ────────────────────────────────────────────────
-def auto_evaluate_quality(item: dict) -> float:
-    """
-    Hub 自动评估知识质量（0-100），不信任节点提交的值。
-    评估维度：内容充实度、标题质量、URL溯源、低质信号检测。
-    """
-    title = item.get("title", "") or ""
-    summary = item.get("summary", "") or ""
-    url = item.get("url", "") or ""
-
-
-    score = 60  # 基础分
-
-    # 1. 标题质量（最高+15）
-    if len(title) < 8:
-        score -= 10
-    elif 10 <= len(title) <= 50:
-        score += 5
-
-    # 2. 摘要质量（最高+20）
-    if len(summary) < 50:
-        score -= 15
-    elif len(summary) >= 50:
-        score += min(15, (len(summary) - 50) // 50 * 5)
-
-    # 3. URL溯源（最高+5）
-    if url and (url.startswith("http://") or url.startswith("https://")):
-        score += 5
-
-    # 4. 低质关键词惩罚（-5~-15）
-    low_quality_signals = [
-        "测试", "占位", "示例", "TODO", "待补充", "暂无",
-        "待定", "暂无内容", "示例数据", "test", "示例文本", "placeholder"
-    ]
-    for signal in low_quality_signals:
-        if signal in title or signal in summary:
-            score -= 5
-
-    # 5. 极短内容惩罚
-    if len(title) + len(summary) < 30:
-        score -= 20
-
-    return max(0, min(100, score))
-
-
-
-def content_hash(title: str, summary: str) -> str:
-    """内容去重 hash"""
-    raw = f"{title.strip().lower()}|||{summary.strip().lower()[:200]}"
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
-
-def simple_search(items: list, query: str = "", topics: list = None, min_quality: float = 0) -> list:
-    """纯 Python 知识搜索"""
-    results = items
-    if query and len(query) >= 2:
-        q = query.lower()
-        def match_item(i):
-            fields = [
-                i.get("title", ""),
-                i.get("summary", ""),
-                " ".join(i.get("tags", []) or []),
-                " ".join(i.get("topics", []) or []),
-            ]
-            return any(q in f.lower() for f in fields)
-        results = [i for i in results if match_item(i)]
-    if topics:
-        results = [i for i in results if any(t in (i.get("topics") or []) for t in topics)]
-    if min_quality > 0:
-        results = [i for i in results if (i.get("quality") or 0) >= min_quality]
-    return results
-
-def open_hub_db(config: dict) -> TinyDB:
+def open_hub_db(config: dict):
     """打开 Hub 数据库"""
-    db_path = HUB_DIR / config["hub_db_path"]
-    os.makedirs(db_path.parent, exist_ok=True)
-    return TinyDB(str(db_path))
+    return open_configured_hub_db(config, HUB_DIR)
 
-def open_local_db(config: dict) -> Optional[TinyDB]:
+def resolve_local_db_path(config: dict) -> Path:
+    """Resolve optional local knowledge DB path from config."""
+    return resolve_config_local_db_path(config, HUB_DIR, CONFIG_PATH)
+
+def open_local_db(config: dict):
     """打开本地知识库（可选，用于合并查询）"""
-    db_path = Path(config.get("local_db_path", ""))
-    if db_path.exists():
-        return TinyDB(str(db_path))
-    return None
+    return open_configured_local_db(config, HUB_DIR, CONFIG_PATH)
 
 
 def _record_usage(items: list, node: str):
     """将查询结果的使用情况回写到本地 TinyDB（和 MCP 的逻辑一致）"""
-    local_db_path = CONFIG_PATH.parent.parent / "knowledge-management" / "knowledge" / "db" / "knowledge-index.json"
+    local_db_path = resolve_local_db_path(NODE_CONFIG)
     today = datetime.now().strftime("%Y-%m-%d")
 
     if local_db_path.exists():
         try:
-            db = TinyDB(str(local_db_path))
-            tbl = db.table("knowledge")
-            for item in items:
-                item_id = item.get("id")
-                if not item_id:
-                    continue
-                for orig in tbl.all():
-                    if orig.get("id") == item_id:
-                        tbl.update(
-                            {
-                                "usage_count": (orig.get("usage_count") or 0) + 1,
-                                "last_used": today,
-                            },
-                            lambda doc, iid=item_id: doc.get("id") == iid
-                        )
-                        break
-            db.close()
+            increment_usage_counts(local_db_path, items, "usage_count", "last_used", today)
         except Exception as e:
             logger.warning(f"本地 usage_count 回写失败: {e}")
 
     try:
-        hub_db_path = HUB_DIR / NODE_CONFIG.get("hub_db_path", "hub_tinydb/knowledge-index.json")
-        if hub_db_path.exists():
-            db = TinyDB(str(hub_db_path))
-            tbl = db.table("knowledge")
-            for item in items:
-                item_id = item.get("id")
-                if not item_id:
-                    continue
-                for orig in tbl.all():
-                    if orig.get("id") == item_id:
-                        tbl.update(
-                            {
-                                "hub_usage_count": (orig.get("hub_usage_count") or 0) + 1,
-                                "hub_last_used": today,
-                            },
-                            lambda doc, iid=item_id: doc.get("id") == iid
-                        )
-                        break
-            db.close()
+        increment_store_usage_counts(NODE_CONFIG, HUB_DIR, items, "hub_usage_count", "hub_last_used", today)
     except Exception as e:
         logger.warning(f"Hub usage_count 回写失败: {e}")
 
 
 def _sync_to_local(item: dict):
     """入库时同步到本地 TinyDB（外部 Agent 知识回流）"""
-    local_db_path = CONFIG_PATH.parent.parent / "knowledge-management" / "knowledge" / "db" / "knowledge-index.json"
-    os.makedirs(local_db_path.parent, exist_ok=True)
+    local_db_path = resolve_local_db_path(NODE_CONFIG)
     try:
-        db = TinyDB(str(local_db_path))
-        tbl = db.table("knowledge")
-        # 检查是否已有相同 id
-        existing = tbl.search(Query().id == item.get("id"))
-        if not existing:
-            tbl.insert(item)
+        inserted = insert_knowledge_if_missing(local_db_path, item)
+        if inserted:
             logger.info(f"同步到本地: {item.get('title', '')[:40]}")
-        db.close()
     except Exception as e:
         logger.warning(f"本地同步失败: {e}")
 
 # ─── FastAPI 应用 ───
 def create_app():
+    global PUBLIC_BASE_PATH
     config = init_config()
     _load_query_stats()  # 恢复查询统计
+    PUBLIC_BASE_PATH = normalize_public_base_path(
+        os.environ.get("KNOWLEDGE_HUB_PUBLIC_BASE_PATH") or config.get("public_base_path", "")
+    )
 
     app = FastAPI(
         title="Knowledge Hub",
         description="知识中心统一查询 & 同步 API",
         version="1.0.0"
     )
+    node_state = {"nodes": NODE_TOKENS, "tokens": NODE_TOKEN_MAP}
+
+    def _sync_admin_node_state():
+        global NODE_TOKENS, NODE_TOKEN_MAP
+        NODE_TOKENS = node_state["nodes"]
+        NODE_TOKEN_MAP = node_state["tokens"]
+    routed_app = app
+    if PUBLIC_BASE_PATH:
+        root_app = FastAPI(title="Knowledge Hub", version="1.0.0")
+        root_app.mount(PUBLIC_BASE_PATH, app)
+        routed_app = root_app
 
     # ── 静态文件（Logo 等）──
     static_dir = HUB_DIR / "static"
@@ -481,12 +444,13 @@ def create_app():
         from i18n import normalize_lang, SUPPORTED_LANGS
         new_lang = normalize_lang(lang)
         # HTML 响应以便浏览器接受 Set-Cookie
+        safe_redirect = redirect if redirect.startswith(PUBLIC_BASE_PATH + "/") else public_path(redirect)
         html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url={redirect}">
-<script>document.cookie='lang={new_lang};path=/;max-age=31536000';location.replace('{redirect}')</script>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url={safe_redirect}">
+<script>document.cookie='lang={new_lang};path={PUBLIC_BASE_PATH or "/"};max-age=31536000';location.replace('{safe_redirect}')</script>
 </head><body>Switching language...</body></html>"""
         resp = HTMLResponse(html)
-        resp.set_cookie("lang", new_lang, max_age=31536000, path="/")
+        resp.set_cookie("lang", new_lang, max_age=31536000, path=PUBLIC_BASE_PATH or "/")
         return resp
 
     @app.get("/i18n.js")
@@ -512,41 +476,31 @@ def create_app():
         topics_filter = req.get("topics", [])
         min_quality = float(req.get("min_quality", 0))
         limit = int(req.get("limit", 10))
+        include_content = bool(req.get("include_content", False))
+        include_chunks = bool(req.get("include_chunks", False))
+        search_mode = req.get("search_mode", "keyword")
 
         # 查 Hub
-        hub_db = open_hub_db(config)
-        hub_items = hub_db.table("knowledge").all()
-        hub_db.close()
-        hub_results = simple_search(hub_items, query_text, topics_filter, min_quality)
+        hub_items = read_knowledge_items(config, HUB_DIR)
 
         # 查本地（如果可用）
-        local_results = []
+        local_items = []
         local_db = open_local_db(config)
         if local_db:
             local_items = local_db.table("knowledge").all()
             local_db.close()
-            local_results = simple_search(local_items, query_text, topics_filter, min_quality)
 
-        # 合并 + 去重
-        seen = set()
-        merged = []
-        for item in hub_results + local_results:
-            h = content_hash(item.get("title", ""), item.get("summary", ""))
-            if h not in seen:
-                seen.add(h)
-                merged.append({
-                    "id": item.get("id"),
-                    "title": item.get("title"),
-                    "summary": (item.get("summary") or "")[:200],
-                    "source": item.get("source"),
-                    "source_date": item.get("source_date"),
-                    "url": item.get("url"),
-                    "topics": item.get("topics", []),
-                    "quality": item.get("quality"),
-                    "source_node": item.get("source_node", "unknown"),
-                    "archive_url": item.get("archive_url"),
-                })
-        merged = merged[:limit]
+        merged = build_query_results(
+            hub_items,
+            local_items,
+            query_text=query_text,
+            topics_filter=topics_filter,
+            min_quality=min_quality,
+            limit=limit,
+            include_content=include_content,
+            include_chunks=include_chunks,
+            search_mode=search_mode,
+        )
 
         # ─── 回写使用记录到本地 TinyDB ───
         _record_usage(merged, node_info["name"])
@@ -578,48 +532,34 @@ def create_app():
 
         ingested = []
         skipped = []
+        existing_hashes = set(CONTENT_HASH_INDEX.keys())
 
         for item in items:
-            # 大小检查
-            size = len(json.dumps(item, ensure_ascii=False))
-            if size > config.get("max_item_size_bytes", 10240):
-                skipped.append({"title": item.get("title"), "reason": "too_large"})
+            item, skipped_detail = validate_knowledge_item(item, config)
+            if skipped_detail:
+                skipped.append(skipped_detail)
                 continue
 
-            # 质量门槛（使用 Hub 自动评估，不信任节点提交的值）
-            auto_quality = auto_evaluate_quality(item)
-            # 节点提交的值仅供参考（用于记录，不用于判断）
-            submitted_quality = item.get("quality", 0)
-            if auto_quality < config.get("quality_threshold", 60):
-                skipped.append({"title": item.get("title"), "reason": "quality_too_low", "auto_score": auto_quality, "submitted_score": submitted_quality})
+            item, skipped_detail, item_hash = prepare_ingest_item(
+                item,
+                node_info["name"],
+                existing_hashes,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                config=config,
+                base_dir=HUB_DIR,
+            )
+            if skipped_detail:
+                skipped.append(skipped_detail)
                 continue
 
-            # 用 Hub 评估分数覆盖节点提交值
-            item["quality"] = auto_quality
-
-            # 标记来源
-            item["source_node"] = node_info["name"]
-            if not item.get("id"):
-                item["id"] = f"hub-{content_hash(item.get('title', ''), item.get('summary', ''))}"
-            if "created_at" not in item:
-                item["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # 去重：O(1) hash 索引查找
-            item_hash = content_hash(item.get("title", ""), item.get("summary", ""))
-            if item_hash in CONTENT_HASH_INDEX:
-                skipped.append({"title": item.get("title"), "reason": "duplicate"})
-                continue
-
-            hub_db = open_hub_db(config)
-            hub_tbl = hub_db.table("knowledge")
-            hub_tbl.insert(item)
-            hub_db.close()
+            insert_knowledge_item(config, HUB_DIR, item)
 
             # 同时写入本地 TinyDB（如果还没有）
             _sync_to_local(item)
 
             # 更新内存索引
             CONTENT_HASH_INDEX[item_hash] = True
+            existing_hashes.add(item_hash)
 
             ingested.append(item.get("title"))
 
@@ -649,97 +589,62 @@ def create_app():
             raise HTTPException(400, t(lang, "error.bad_request", detail="items must be a list"))
 
         # 用内存索引做 O(1) 查找
-        hub_db = open_hub_db(config)
-        hub_tbl = hub_db.table("knowledge")
-        existing_items = hub_tbl.all()
+        existing_items = read_knowledge_items(config, HUB_DIR)
         existing_hashes = {content_hash(e.get("title", ""), e.get("summary", "")): e for e in existing_items}
-        hub_db.close()
 
         new_count = 0
         updated_count = 0
+        skipped = []
         for item in items:
-            item_hash = content_hash(item.get("title", ""), item.get("summary", ""))
-            item["source_node"] = node_info["name"]
+            item, skipped_detail = validate_knowledge_item(item, config)
+            if skipped_detail:
+                skipped.append(skipped_detail)
+                continue
 
-            if item_hash in existing_hashes:
-                existing_item = existing_hashes[item_hash]
-                existing_quality = existing_item.get("quality", 0)
-                new_quality = item.get("quality", 0)
-                # 以高质量版本为准
-                if new_quality > existing_quality:
-                    existing_item.update(item)
-                    hub_db = open_hub_db(config)
-                    hub_tbl = hub_db.table("knowledge")
-                    hub_tbl.update(
-                        existing_item,
-                        lambda doc: doc.get("id") == existing_item.get("id")
-                    )
-                    hub_db.close()
-                    updated_count += 1
-            else:
-                item["id"] = f"hub-sync-{item_hash}"
-                hub_db = open_hub_db(config)
-                hub_tbl = hub_db.table("knowledge")
-                hub_tbl.insert(item)
-                hub_db.close()
+            action, prepared_item, item_hash = prepare_sync_item(
+                item,
+                node_info["name"],
+                existing_hashes,
+                config=config,
+                base_dir=HUB_DIR,
+            )
+
+            if action == "update":
+                update_knowledge_store_item(config, HUB_DIR, prepared_item.get("id"), prepared_item)
+                existing_hashes[item_hash] = prepared_item
+                updated_count += 1
+            elif action == "insert":
+                insert_knowledge_item(config, HUB_DIR, prepared_item)
                 new_count += 1
                 # 更新内存索引
                 CONTENT_HASH_INDEX[item_hash] = True
+                existing_hashes[item_hash] = prepared_item
 
-        hub_db.close()
         audit_log("sync", node_info["name"], f"new={new_count} updated={updated_count}")
-        return {"status": "ok", "new": new_count, "updated": updated_count}
+        return {"status": "ok", "new": new_count, "updated": updated_count, "skipped": skipped}
 
     # ── 统计接口 ──
     @app.get("/stats")
     def get_stats(node_info: dict = Depends(authenticate_node_or_admin)):
         """Hub 全局统计"""
-        hub_db = open_hub_db(config)
-        hub_tbl = hub_db.table("knowledge").all()
-        hub_db.close()
+        hub_tbl = read_knowledge_items(config, HUB_DIR)
 
-        from collections import Counter
-        topics = Counter()
-        nodes = Counter()
-        for i in hub_tbl:
-            for t in (i.get("topics") or []):
-                topics[t] += 1
-            nodes[i.get("source_node", "unknown")] += 1
-
-        return {
-            "total": len(hub_tbl),
-            "source_nodes": dict(nodes),
-            "top_topics": dict(topics.most_common(10)),
-        }
+        return build_hub_stats(hub_tbl)
 
     # ── 节点查询统计 ──
     @app.get("/node-stats")
     def get_node_stats(node_info: dict = Depends(authenticate_node_or_admin)):
         """节点知识查询统计：每个节点调用了多少次、返回多少结果"""
-        stats = []
-        for node_name, info in NODE_QUERY_STATS.items():
-            stats.append({
-                "node": node_name,
-                "role": NODE_TOKENS.get(node_name, {}).get("role", "unknown"),
-                "query_count": info["query_count"],
-                "last_query": info["last_query"],
-                "total_results": info["total_results"],
-            })
-        stats.sort(key=lambda x: x["query_count"], reverse=True)
-        return {
-            "total_nodes_queried": len(stats),
-            "total_queries": sum(s["query_count"] for s in stats),
-            "nodes": stats,
-        }
+        return build_node_query_stats(NODE_QUERY_STATS, NODE_TOKENS)
 
     # ── Token 查询（管理员用） ──
     @app.get("/tokens")
-    def list_tokens():
+    def list_tokens(node_info: dict = Depends(authenticate_node_or_admin)):
         """列出所有节点 Token"""
-        return {
-            name: {"role": info["role"], "token": info["token"], "description": info["description"]}
-            for name, info in NODE_TOKENS.items()
-        }
+        from i18n import t
+        if node_info.get("role") != "admin":
+            raise HTTPException(403, t(node_info.get("lang", "zh"), "auth.access_denied"))
+        return build_token_listing(NODE_TOKENS)
 
     # ── 公开接入文档（通过 token 访问） ──
     @app.get("/access")
@@ -759,7 +664,7 @@ def create_app():
             return {"error": t(cur_lang, "auth.invalid_token")}
 
         info = NODE_TOKENS[node]
-        base_url = f"http://101.201.232.176:{config.get('port', 10128)}"
+        base_url = public_base_url(request) or f"http://101.201.232.176:{config.get('port', 10128)}"
 
         # 语言切换栏
         lang_switch = (
@@ -768,7 +673,7 @@ def create_app():
             f"[English]({base_url}/access?token={token}&lang=en)\n\n---\n\n"
         )
 
-        md = f"""<img src=\"/static/logo.png\" style=\"width:48px;height:48px;border-radius:10px;filter:drop-shadow(0 2px 8px rgba(59,130,246,0.3))\" alt=\"Logo\"><br><br>\n\n# Knowledge Hub — {node} {t(cur_lang, "access.title")}
+        md = f"""<img src=\"{public_path('/static/logo.png')}\" style=\"width:48px;height:48px;border-radius:10px;filter:drop-shadow(0 2px 8px rgba(59,130,246,0.3))\" alt=\"Logo\"><br><br>\n\n# Knowledge Hub — {node} {t(cur_lang, "access.title")}
 
 {lang_switch}
 
@@ -914,104 +819,74 @@ Hub 提供可视化看板，你的用户可以通过以下链接查看知识库�
         """知识使用统计：哪些知识被用得最多，支持知识评价体系"""
         # 本地 TinyDB usage_count
         local_data = []
-        local_db_path = CONFIG_PATH.parent.parent / "knowledge-management" / "knowledge" / "db" / "knowledge-index.json"
+        local_db_path = resolve_local_db_path(config)
         if local_db_path.exists():
             try:
-                db = TinyDB(str(local_db_path))
-                tbl = db.table("knowledge").all()
-                db.close()
+                tbl = read_table(local_db_path, "knowledge")
                 local_data = [{"id": i.get("id"), "title": i.get("title"), "usage_count": i.get("usage_count", 0), "last_used": i.get("last_used", "")} for i in tbl if i.get("usage_count", 0) > 0]
             except Exception:
                 pass
 
         # Hub usage_count
         hub_data = []
-        hub_db_path = HUB_DIR / config.get("hub_db_path", "hub_tinydb/knowledge-index.json")
-        if hub_db_path.exists():
-            try:
-                db = TinyDB(str(hub_db_path))
-                tbl = db.table("knowledge").all()
-                db.close()
-                hub_data = [{"id": i.get("id"), "title": i.get("title"), "hub_usage_count": i.get("hub_usage_count", 0), "hub_last_used": i.get("hub_last_used", "")} for i in tbl if i.get("hub_usage_count", 0) > 0]
-            except Exception:
-                pass
+        try:
+            tbl = read_knowledge_items(config, HUB_DIR)
+            hub_data = [{"id": i.get("id"), "title": i.get("title"), "hub_usage_count": i.get("hub_usage_count", 0), "hub_last_used": i.get("hub_last_used", "")} for i in tbl if i.get("hub_usage_count", 0) > 0]
+        except Exception:
+            pass
 
-        # 合并：按 id 去重
-        merged = {}
-        for item in local_data:
-            merged[item["id"]] = {"id": item["id"], "title": item["title"], "local_usage": item["usage_count"], "local_last_used": item["last_used"], "hub_usage": 0, "hub_last_used": ""}
-        for item in hub_data:
-            if item["id"] in merged:
-                merged[item["id"]]["hub_usage"] = item["hub_usage_count"]
-                merged[item["id"]]["hub_last_used"] = item["hub_last_used"]
-            else:
-                merged[item["id"]] = {"id": item["id"], "title": item["title"], "local_usage": 0, "local_last_used": "", "hub_usage": item["hub_usage_count"], "hub_last_used": item["hub_last_used"]}
-
-        # 按总使用量排序
-        all_items = sorted(merged.values(), key=lambda x: x["local_usage"] + x["hub_usage"], reverse=True)[:20]
-
-        return {
-            "total_used": len(all_items),
-            "top_used": all_items,
-        }
+        return build_usage_stats(local_data, hub_data)
 
     # ── 可视化看板（带 token 鉴权） ──
     @app.get("/dashboard")
     def dashboard(token: str = None, request: Request = None, lang: str = None):
-        """可视化看板：http://IP:10128/dashboard?token=xxx"""
+        """可视化看板。旧 token 链接会换取短期 cookie 并重定向到无 token URL。"""
         from i18n import t
         cur_lang = resolve_lang(request, lang_param=lang)
-        if not token:
-            return {"error": t(cur_lang, "error.bad_request", detail="token required")}
-        node = NODE_TOKEN_MAP.get(token)
-        if not node:
-            return {"error": t(cur_lang, "auth.invalid_token")}
+        node = None
+        if token:
+            node = NODE_TOKEN_MAP.get(token)
+            if not node:
+                return {"error": t(cur_lang, "auth.invalid_token")}
+            session_id = secrets.token_urlsafe(32)
+            DASHBOARD_SESSIONS[session_id] = {"node": node, "created_at": time.time()}
+            resp = RedirectResponse(url=public_path("/dashboard"), status_code=302)
+            resp.set_cookie(
+                DASHBOARD_SESSION_COOKIE,
+                session_id,
+                httponly=True,
+                max_age=int(config.get("dashboard_session_ttl_seconds", 3600) or 3600),
+                samesite="lax",
+                path=PUBLIC_BASE_PATH or "/",
+            )
+            return resp
+
+        dashboard_session = authenticate_dashboard(request)
+        if dashboard_session:
+            node = dashboard_session["node"]
+        elif authenticate_admin(request):
+            node = next(iter(NODE_TOKENS.keys()), "admin")
+        else:
+            return {"error": t(cur_lang, "error.bad_request", detail="dashboard session required")}
 
         node_info = NODE_TOKENS[node]
 
-        hub_db = open_hub_db(config)
-        all_items = hub_db.table("knowledge").all()
-        hub_db.close()
+        all_items = read_knowledge_items(config, HUB_DIR)
 
-        from collections import Counter, defaultdict
-        from datetime import timedelta
-
-        nodes_counter = Counter()
-        node_qualities = defaultdict(list)
-        topics_counter = Counter()
-        categories_counter = Counter()
-        dates_counter = Counter()
-        quality_ranges = {"60-70": 0, "70-85": 0, "85-100": 0}
-
-        for item in all_items:
-            sn = item.get("source_node", "unknown")
-            nodes_counter[sn] += 1
-            node_qualities[sn].append(item.get("quality", 0))
-            # 统计分类
-            cat = item.get("category", "其他")
-            categories_counter[cat] += 1
-            # 统计标签（topics）
-            for t in (item.get("topics") or []):
-                topics_counter[t] += 1
-            ca = item.get("created_at", "")
-            if ca and len(ca) >= 10:
-                dates_counter[ca[:10]] += 1
-            q = item.get("quality", 0)
-            if q < 70: quality_ranges["60-70"] += 1
-            elif q < 85: quality_ranges["70-85"] += 1
-            else: quality_ranges["85-100"] += 1
-
-        now = datetime.now()
-        last_7 = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
-        node_activity = {}
-        for nk in NODE_TOKENS:
-            node_activity[nk] = sum(1 for i in all_items if i.get("source_node") == nk and i.get("created_at", "")[:10] in last_7)
-
-        recent_items = sorted(all_items, key=lambda x: x.get("created_at", ""), reverse=True)[:15]
-        total = len(all_items)
-        avg_quality = round(sum(i.get("quality", 0) for i in all_items) / max(total, 1), 1)
-        active_nodes = len(nodes_counter)
-        total_topics = len(topics_counter)
+        dashboard_model = build_dashboard_model(all_items, NODE_TOKENS, datetime.now())
+        nodes_counter = dashboard_model["nodes_counter"]
+        node_qualities = dashboard_model["node_qualities"]
+        topics_counter = dashboard_model["topics_counter"]
+        categories_counter = dashboard_model["categories_counter"]
+        dates_counter = dashboard_model["dates_counter"]
+        quality_ranges = dashboard_model["quality_ranges"]
+        last_7 = dashboard_model["last_7"]
+        node_activity = dashboard_model["node_activity"]
+        recent_items = dashboard_model["recent_items"]
+        total = dashboard_model["total"]
+        avg_quality = dashboard_model["avg_quality"]
+        active_nodes = dashboard_model["active_nodes"]
+        total_topics = dashboard_model["total_topics"]
         import html as hm
 
         # ── 节点卡片 ──
@@ -1520,6 +1395,7 @@ new Chart(document.getElementById('resultChart'), {
 });
 </script>
 </body></html>"""
+        html = prepare_html_for_public_base(html)
         return HTMLResponse(html, headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"})
 
     # ── 管理后台 ───────────────────────────────────────────────
@@ -1537,16 +1413,17 @@ new Chart(document.getElementById('resultChart'), {
         session = authenticate_admin(request)
         if not session:
             # 未登录，返回登录表单
-            login_html = ADMIN_LOGIN_HTML.replace("__REDIRECT__", "/admin").replace("__ERR_MSG__", "")
+            login_html = (ADMIN_LOGIN_HTML
+                          .replace("__REDIRECT__", public_path("/admin"))
+                          .replace("__ERR_MSG__", ""))
+            login_html = prepare_html_for_public_base(login_html)
             return HTMLResponse(login_html, status_code=401)
 
         admin_user = session["username"]
         admin_token = ""  # 不再使用 token
 
         import html as hm
-        hub_db = open_hub_db(config)
-        all_items = hub_db.table("knowledge").all()
-        hub_db.close()
+        all_items = read_knowledge_items(config, HUB_DIR)
 
         categories = ["行业政策","新闻资讯","金融资本","产品方案","技术资料","数据资产","其他"]
         nodes = list(NODE_TOKENS.keys())
@@ -1910,6 +1787,7 @@ let allItems = [];
 let filteredItems = [];
 let page = 1;
 const PAGE_SIZE = 20;
+let totalItems = 0;
 let debounceTimer = null;
 
 async function api(method, path, body=null) {{
@@ -1926,32 +1804,17 @@ async function loadItems(p=1) {{
   let cat = document.getElementById('catFilter').value;
   let node = document.getElementById('nodeFilter').value;
   let qual = parseInt(document.getElementById('qualFilter').value) || 0;
-  if (!allItems.length) {{
-    let data = await api('GET', '/stats');
-    let total = data.total || 0;
-    let batchSize = 200;
-    for (let offset = 0; offset < total; offset += batchSize) {{
-      let r = await api('POST', '/query', {{query:'', limit: batchSize}});
-      allItems.push(...r.items);
-      if (r.items.length < batchSize) break;
-    }}
-  }}
-  filteredItems = allItems.filter(i => {{
-    let match = true;
-    if (q && !(i.title||'').toLowerCase().includes(q.toLowerCase())) match = false;
-    if (cat && i.category !== cat) match = false;
-    if (node && i.source_node !== node) match = false;
-    if (qual && (i.quality||0) < qual) match = false;
-    return match;
-  }});
-  document.getElementById('totalSpan').textContent = `共 ${{filteredItems.length}} 条`;
+  let params = new URLSearchParams({{q, category:cat, node, min_quality:String(qual), page:String(page), size:String(PAGE_SIZE)}});
+  let data = await api('GET', '/admin/items?' + params.toString());
+  filteredItems = data.items || [];
+  allItems = filteredItems;
+  totalItems = data.total || 0;
+  document.getElementById('totalSpan').textContent = `共 ${{totalItems}} 条`;
   renderItems();
 }}
 
 function renderItems() {{
-  let start = (page-1)*PAGE_SIZE;
-  let end = start + PAGE_SIZE;
-  let slice = filteredItems.slice(start, end);
+  let slice = filteredItems;
   let tbody = document.getElementById('itemsBody');
   if (!slice.length) {{
     tbody.innerHTML = '<tr class=\"empty-row\"><td colspan=\"6\">暂无数据</td></tr>';
@@ -1976,14 +1839,14 @@ function renderItems() {{
       </td>
     </tr>`;
   }}).join('');
-  let totalPages = Math.ceil(filteredItems.length / PAGE_SIZE);
+  let totalPages = Math.ceil(totalItems / PAGE_SIZE);
   document.getElementById('pageInfo').textContent = `第 ${{page}} / ${{totalPages||1}} 页`;
   document.getElementById('prevBtn').disabled = page <= 1;
   document.getElementById('nextBtn').disabled = page >= totalPages;
 }}
 
 function changePage(dir) {{
-  let totalPages = Math.ceil(filteredItems.length / PAGE_SIZE);
+  let totalPages = Math.ceil(totalItems / PAGE_SIZE);
   let newPage = page + dir;
   if (newPage < 1 || newPage > totalPages) return;
   loadItems(newPage);
@@ -2026,7 +1889,7 @@ async function saveItem() {{
     source: document.getElementById('editSource').value,
   }};
   try {{
-    await api('POST', '/sync', {{items:[updated]}});
+    await api('PUT', '/admin/item/' + encodeURIComponent(id), updated);
     allItems = allItems.map(x => x.id===id ? {{...x,...updated}} : x);
     closeModal();
     loadItems(page);
@@ -2035,7 +1898,7 @@ async function saveItem() {{
 
 async function deleteItemConfirm(id) {{
   if (!confirm('确定删除这条知识？')) return;
-  // Re-ingest with deleted marker handled server-side
+  await api('DELETE', '/admin/item/' + encodeURIComponent(id));
   allItems = allItems.filter(x => x.id !== id);
   closeModal();
   loadItems(page);
@@ -2071,13 +1934,7 @@ async function createNode() {{
   let desc = document.getElementById('newNodeDesc').value;
   if (!name) {{alert('请输入节点名称');return;}}
   try {{
-    let r = await fetch(BASE + '/admin/node', {{
-      method: 'POST',
-      credentials: 'include',
-      method:'POST', headers:HEAD,
-      body:JSON.stringify({{name, role, description:desc}})
-    }});
-    if (!r.ok) {{let e=await r.text();alert('失败: '+e);return;}}
+    await api('POST', '/admin/node', {{name, role, description:desc}});
     closeNodeModal();
     loadNodes();
   }} catch(e) {{alert('创建失败');}}
@@ -2086,14 +1943,9 @@ async function createNode() {{
 async function resetToken(nodeName) {{
   if (!confirm(`确定重置 ${{nodeName}} 的 Token？旧 Token 将失效。`)) return;
   try {{
-    let r = await fetch(BASE + '/admin/node/' + encodeURIComponent(nodeName) + '/reset-token', {{
-      method: 'POST',
-      credentials: 'include',
-      method:'POST', headers:HEAD
-    }});
-    let data = await r.json();
-    if (r.ok) {{alert('新 Token: ' + data.token);loadNodes();}}
-    else {{alert('失败: ' + await r.text());}}
+    let data = await api('POST', '/admin/node/' + encodeURIComponent(nodeName) + '/reset-token');
+    alert('新 Token: ' + data.token);
+    loadNodes();
   }} catch(e) {{alert('重置失败');}}
 }}
 
@@ -2103,7 +1955,7 @@ async function loadLog() {{
     let lines = await r.text();
     let rows = lines.trim().split('\\n').slice(-50).reverse();
     document.getElementById('logBody').innerHTML = rows.map(line => {{
-      let parts = line.match(/^([^\s]+)\s\[([^\]]+)\]\sAUDIT\s\|\snode=([^\s]+)\s\|\saction=([^\s]+)\s\|\s(.+)$/);
+      let parts = line.match(/^([^\\s]+)\\s\\[([^\\]]+)\\]\\sAUDIT\\s\\|\\snode=([^\\s]+)\\s\\|\\saction=([^\\s]+)\\s\\|\\s(.+)$/);
       if (!parts) return `<tr><td colspan=\"4\" style=\"color:var(--t2);font-size:12px\">${{line}}</td></tr>`;
       return `<tr>
         <td class=\"t-date\">${{parts[1]}}</td>
@@ -2132,6 +1984,7 @@ function showTab(name) {{
 loadItems(1);
 </script>
 </body></html>"""
+        html = prepare_html_for_public_base(html)
         return HTMLResponse(html, headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"})
 
     # ── 管理后台 API ────────────────────────────────────────────────
@@ -2151,16 +2004,17 @@ loadItems(1);
             login_html = (ADMIN_LOGIN_HTML
                           .replace("__REDIRECT__", redirect)
                           .replace("__ERR_MSG__", "用户名或密码错误"))
+            login_html = prepare_html_for_public_base(login_html)
             return HTMLResponse(login_html, status_code=401)
 
         session_id = secrets.token_urlsafe(32)
         ADMIN_SESSIONS[session_id] = {"username": username, "created_at": time.time()}
         audit_log("admin.login", username, success=True)
 
-        target = redirect if redirect.startswith("/") else "/admin"
+        target = redirect if redirect.startswith(PUBLIC_BASE_PATH + "/") else public_path(redirect)
         resp = RedirectResponse(url=target, status_code=302)
         resp.set_cookie(ADMIN_SESSION_COOKIE, session_id,
-                        httponly=True, max_age=86400, samesite="lax", path="/")
+                        httponly=True, max_age=86400, samesite="lax", path=PUBLIC_BASE_PATH or "/")
         return resp
 
     @app.get("/admin/logout")
@@ -2171,82 +2025,34 @@ loadItems(1);
             username = ADMIN_SESSIONS[cookie]["username"]
             del ADMIN_SESSIONS[cookie]
             audit_log("admin.logout", username, success=True)
-        resp = RedirectResponse(url="/admin", status_code=302)
-        resp.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+        resp = RedirectResponse(url=public_path("/admin"), status_code=302)
+        resp.delete_cookie(ADMIN_SESSION_COOKIE, path=PUBLIC_BASE_PATH or "/")
         return resp
 
-    def _require_admin_via_cookie(request: Request) -> dict:
-        """辅助函数：检查 admin session cookie（API 调用）"""
-        session = authenticate_admin(request)
-        if not session:
-            raise HTTPException(401, "Admin session required")
-        return session
+    def _save_config_node_and_sync(name: str, token: str, role: str, description: str):
+        _save_config_node(name, token, role, description)
+        _sync_admin_node_state()
 
-    @app.post("/admin/node")
-    def admin_create_node(req: dict, request: Request):
-        from i18n import t
-        admin_session = _require_admin_via_cookie(request)
-        username = admin_session["username"]
-        # 额外兼容 Bearer token（保留向后兼容）
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            legacy_token = auth_header[7:]
-            legacy_node = NODE_TOKEN_MAP.get(legacy_token)
-            if legacy_node and NODE_TOKENS[legacy_node]["role"] == "admin":
-                username = f"{username} (legacy:{legacy_node})"
+    register_admin_api_routes(
+        app,
+        node_state=node_state,
+        authenticate_admin=authenticate_admin,
+        resolve_admin_bearer=resolve_admin_bearer,
+        save_config_node=_save_config_node_and_sync,
+        audit_log=audit_log,
+        update_item=lambda item_id, patch: update_knowledge_store_item(config, HUB_DIR, item_id, patch),
+        delete_item=lambda item_id: delete_knowledge_store_item(config, HUB_DIR, item_id),
+        list_items=lambda: read_knowledge_items(config, HUB_DIR),
+        maintain_store=lambda vacuum=False: maintain_knowledge_store(config, HUB_DIR, vacuum=vacuum),
+        log_path=Path(LOG_PATH),
+    )
 
-        name = req.get("name", "").strip()
-        role = req.get("role", "reader")
-        desc = req.get("description", "")
-        if not name or name in NODE_TOKENS:
-            raise HTTPException(400, t("zh", "error.bad_request", detail="node name empty or exists"))
-        token = secrets.token_urlsafe(24)
-        NODE_TOKENS[name] = {"token": token, "role": role, "description": desc}
-        NODE_TOKEN_MAP[token] = name
-        _save_config_node(name, token, role, desc)
-        audit_log("create_node", username, f"node={name} role={role}")
-        return {"status": "ok", "name": name, "token": token}
-
-    @app.post("/admin/node/{node_name}/reset-token")
-    def admin_reset_token(node_name: str, request: Request):
-        from i18n import t
-        admin_session = _require_admin_via_cookie(request)
-        if node_name not in NODE_TOKENS:
-            raise HTTPException(404, t("zh", "error.not_found"))
-        old_token = NODE_TOKENS[node_name]["token"]
-        new_token = secrets.token_urlsafe(24)
-        del NODE_TOKEN_MAP[old_token]
-        NODE_TOKENS[node_name]["token"] = new_token
-        NODE_TOKEN_MAP[new_token] = node_name
-        _save_config_node(node_name, new_token, NODE_TOKENS[node_name]["role"],
-                          NODE_TOKENS[node_name]["description"])
-        audit_log("reset_token", admin_session["username"], f"node={node_name}")
-        return {"status": "ok", "name": node_name, "token": new_token}
-
-    @app.get("/admin/log")
-    def admin_get_log(request: Request, page: int = 1, size: int = 50):
-        from i18n import t
-        admin_session = _require_admin_via_cookie(request)
-        try:
-            lines = Path(LOG_PATH).read_text().split("\n")
-            lines = [l for l in lines if l.strip() and "AUDIT" in l]
-            total = len(lines)
-            lines.reverse()
-            start = (page - 1) * size
-            end = start + size
-            page_lines = lines[start:end]
-            return {"total": total, "lines": page_lines, "page": page, "size": size}
-        except Exception as e:
-            raise HTTPException(500, str(e))
-
-    return app
+    return routed_app
 
 def _save_config_node(name: str, token: str, role: str, description: str):
     """保存节点配置到 config.json"""
     cfg = json.loads(CONFIG_PATH.read_text())
-    if "nodes" not in cfg:
-        cfg["nodes"] = {}
-    cfg["nodes"][name] = {"token": token, "role": role, "description": description}
+    cfg = upsert_config_node(cfg, name, token, role, description)
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
 
 # ─── 启动 ───

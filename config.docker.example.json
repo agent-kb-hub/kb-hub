@@ -1,11 +1,10 @@
 {
-  "port": 10131,
+  "port": 10128,
   "host": "0.0.0.0",
   "storage_backend": "tinydb",
   "hub_db_path": "hub_tinydb/knowledge-index.json",
   "sqlite_db_path": "hub_sqlite/knowledge.sqlite3",
   "tinydb_source_path": "hub_tinydb/knowledge-index.json",
-  "local_db_path": "/home/admin/.openclaw/workspace/skills/knowledge-management/knowledge/db/knowledge-index.json",
   "log_path": "logs/audit.log",
   "rate_limit_per_node": 100,
   "rate_limit_window_seconds": 60,
@@ -21,66 +20,18 @@
     "admin": "sha256:<salt>:<hash>"
   },
   "nodes": {
-    "my-agent": {
-      "token": "<your-token>",
+    "admin-node": {
+      "token": "<replace-with-admin-token>",
+      "role": "admin",
+      "description": "Admin node"
+    },
+    "writer-node": {
+      "token": "<replace-with-writer-token>",
       "role": "writer",
-      "description": "My Agent"
+      "description": "Writer node"
     }
   },
   "topic_map": {
-    "可信数据空间": [
-      "可信数据空间",
-      "数据空间",
-      "城市可信空间"
-    ],
-    "数据政策": [
-      "政策",
-      "规划",
-      "行动方案",
-      "行动计划",
-      "管理办法"
-    ],
-    "能源互联网": [
-      "能源互联网",
-      "能源数据",
-      "虚拟电厂",
-      "电网",
-      "储能"
-    ],
-    "充电桩": [
-      "充电桩",
-      "充电运营",
-      "V2G",
-      "充电站"
-    ],
-    "朗新科技": [
-      "朗新科技",
-      "朗新集团",
-      "LongShine"
-    ],
-    "电力市场": [
-      "电力市场",
-      "电力交易",
-      "售电",
-      "现货市场"
-    ],
-    "数据要素": [
-      "数据要素",
-      "数据流通",
-      "数据产品",
-      "数据资产"
-    ],
-    "人工智能": [
-      "人工智能",
-      "AI",
-      "大模型",
-      "智能算力"
-    ],
-    "城市运营": [
-      "城市治理",
-      "智慧城市",
-      "城市运营"
-    ],
     "其他": []
   },
   "category_rules": {
