@@ -7,6 +7,7 @@ set -e
 
 PORT=10128
 ADMIN_TOKEN=""
+ADMIN_PASSWORD="${KNOWLEDGE_HUB_ADMIN_PASSWORD:-}"
 HUB_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ─── Color helpers ───
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --port) PORT="$2"; shift 2 ;;
     --admin-token) ADMIN_TOKEN="$2"; shift 2 ;;
+    --admin-password) ADMIN_PASSWORD="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -54,16 +56,32 @@ source "$HUB_DIR/.venv/bin/activate"
 
 # ─── Dependencies ───
 log "Installing dependencies..."
-pip install -q fastapi uvicorn tinydb requests
+pip install -q -r "$HUB_DIR/requirements.txt"
 
 # ─── Generate tokens ───
 if [[ -z "$ADMIN_TOKEN" ]]; then
   ADMIN_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 fi
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+  ADMIN_PASSWORD=$(python3 -c "import secrets; print(secrets.token_urlsafe(18))")
+fi
 WRITER_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")
+ADMIN_PASSWORD_HASH=$(ADMIN_PASSWORD="$ADMIN_PASSWORD" python3 - <<'PY'
+import hashlib
+import os
+import secrets
+
+password = os.environ["ADMIN_PASSWORD"]
+salt = secrets.token_hex(16)
+digest = hashlib.sha256((salt + password).encode()).hexdigest()
+print(f"sha256:{salt}:{digest}")
+PY
+)
 
 log "Admin token:  $ADMIN_TOKEN"
 log "Writer token: $WRITER_TOKEN"
+log "Admin user:   admin"
+log "Admin pass:   $ADMIN_PASSWORD"
 
 # ─── Create config ───
 cat > "$HUB_DIR/config.json" << EOF
@@ -72,6 +90,11 @@ cat > "$HUB_DIR/config.json" << EOF
   "host": "0.0.0.0",
   "quality_threshold": 60,
   "max_item_size_bytes": 10240,
+  "rate_limit_per_node": 100,
+  "rate_limit_window_seconds": 60,
+  "admin_users": {
+    "admin": "$ADMIN_PASSWORD_HASH"
+  },
   "nodes": {
     "admin-node": {
       "token": "$ADMIN_TOKEN",
@@ -139,9 +162,11 @@ log "═════════════════════════
 log ""
 log "  Server:   http://127.0.0.1:$PORT"
 log "  Health:   curl http://127.0.0.1:$PORT/health"
-log "  Admin:    http://<ip>:$PORT/admin?token=$ADMIN_TOKEN"
+log "  Admin:    http://<ip>:$PORT/admin"
 log "  Dashboard:http://<ip>:$PORT/dashboard?token=$ADMIN_TOKEN"
 log ""
+log "  Admin user:   admin"
+log "  Admin pass:   $ADMIN_PASSWORD"
 log "  Admin token:  $ADMIN_TOKEN"
 log "  Writer token: $WRITER_TOKEN"
 log ""

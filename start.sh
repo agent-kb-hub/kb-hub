@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 PYTHON="$(pwd)/.venv/bin/python3"
 
 # 启动服务（后台运行）
+mkdir -p logs
 echo "启动 Knowledge Hub..."
 nohup $PYTHON hub_server.py > logs/server.log 2>&1 &
 echo $! > logs/server.pid

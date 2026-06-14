@@ -1,0 +1,25 @@
+services:
+  knowledge-hub:
+    build: .
+    container_name: knowledge-hub
+    restart: unless-stopped
+    ports:
+      - "${KNOWLEDGE_HUB_PORT:-10128}:10128"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./hub_tinydb:/app/hub_tinydb
+      - ./logs:/app/logs
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:10128/health', timeout=3))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

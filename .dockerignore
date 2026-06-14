@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+hub_tinydb
+logs
+config.json
+*.log
+.env
+.DS_Store
+docs/superpowers
