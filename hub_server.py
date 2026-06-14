@@ -1498,6 +1498,9 @@ new Chart(document.getElementById('resultChart'), {
         _current_user = L("admin.current_user")
         _add_node = L("admin.add_node")
         _lang = L("common.language")
+        lang_zh_url = public_path("/lang?lang=zh&redirect=/admin")
+        lang_en_url = public_path("/lang?lang=en&redirect=/admin")
+        admin_logout_url = public_path("/admin/logout")
 
         html = f"""<!DOCTYPE html>
 <html lang="zh">
@@ -1612,9 +1615,9 @@ tr:hover td{{background:rgba(255,255,255,0.02);}}
   </div>
   <span style="font-size:12px;color:var(--t2)">&#128101; {hm.escape(admin_user)}</span>
   <div class="lang-switcher">
-    <a href="/lang?lang=zh&redirect=/admin" class="lang-btn {('active' if cur_lang=='zh' else '')}">中</a>
-    <a href="/lang?lang=en&redirect=/admin" class="lang-btn {('active' if cur_lang=='en' else '')}">EN</a>
-    <a href="/admin/logout" class="lang-btn" style="margin-left:8px;color:#ef4444">&#128682; 退出</a>
+    <a href="{lang_zh_url}" class="lang-btn {('active' if cur_lang=='zh' else '')}">中</a>
+    <a href="{lang_en_url}" class="lang-btn {('active' if cur_lang=='en' else '')}">EN</a>
+    <a href="{admin_logout_url}" class="lang-btn" style="margin-left:8px;color:#ef4444">&#128682; 退出</a>
   </div>
 </div>
 <div class="tab-bar">

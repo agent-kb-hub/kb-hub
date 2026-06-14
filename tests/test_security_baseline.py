@@ -68,6 +68,12 @@ def auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+def admin_password_hash():
+    from knowledge_hub.security import hash_password
+
+    return hash_password("Admin@123456")
+
+
 def test_health_is_public(tmp_path):
     client = build_client(tmp_path)
 
@@ -157,6 +163,37 @@ def test_prefixed_admin_login_form_uses_prefixed_action(tmp_path):
     assert response.status_code == 401
     assert 'action="/avatar-expose/12345678/kb-hub/admin/login"' in response.text
     assert 'value="/avatar-expose/12345678/kb-hub/admin"' in response.text
+
+
+def test_prefixed_admin_panel_uses_prefixed_language_links(tmp_path):
+    client = build_client(
+        tmp_path,
+        {
+            "public_base_path": "/avatar-expose/12345678/kb-hub",
+            "admin_users": {"admin": admin_password_hash()},
+        },
+    )
+
+    login = client.post(
+        "/avatar-expose/12345678/kb-hub/admin/login",
+        data={
+            "username": "admin",
+            "password": "Admin@123456",
+            "redirect": "/avatar-expose/12345678/kb-hub/admin",
+        },
+        follow_redirects=False,
+    )
+    assert login.status_code == 302
+
+    response = client.get(
+        "/avatar-expose/12345678/kb-hub/admin",
+        cookies=login.cookies,
+    )
+
+    assert response.status_code == 200
+    assert 'href="/avatar-expose/12345678/kb-hub/lang?lang=zh&redirect=/admin"' in response.text
+    assert 'href="/avatar-expose/12345678/kb-hub/lang?lang=en&redirect=/admin"' in response.text
+    assert 'href="/lang?lang=en&redirect=/admin"' not in response.text
 
 
 def test_ingest_stores_v2_knowledge_schema(tmp_path):
